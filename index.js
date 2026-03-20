@@ -186,6 +186,25 @@ const buildChatPreviewText = ({ text = '', attachmentUrl = '' }) => {
   return '';
 };
 
+const getPaginationParams = (req, defaults = {}) => {
+  const defaultLimit = defaults.limit || 8;
+  const maxLimit = defaults.maxLimit || 100;
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || defaultLimit, 1), maxLimit);
+  const skip = (page - 1) * limit;
+  return { page, limit, skip };
+};
+
+const buildPaginatedResponse = ({ data, total, page, limit }) => ({
+  success: true,
+  count: data.length,
+  total,
+  page,
+  limit,
+  totalPages: Math.max(1, Math.ceil(total / limit)),
+  data,
+});
+
 const activeSocketCounts = new Map();
 
 const getActiveSocketCount = (email) => activeSocketCounts.get(normalizeEmail(email)) || 0;
@@ -989,8 +1008,12 @@ app.get(
     const db = getDB();
     const status = req.query.status;
     const query = status ? { status } : {};
-    const requests = await db.collection('VendorRequests').find(query).sort({ createdAt: -1 }).toArray();
-    res.json({ success: true, count: requests.length, data: requests });
+    const { page, limit, skip } = getPaginationParams(req);
+    const [requests, total] = await Promise.all([
+      db.collection('VendorRequests').find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      db.collection('VendorRequests').countDocuments(query),
+    ]);
+    res.json(buildPaginatedResponse({ data: requests, total, page, limit }));
   }),
 );
 
@@ -1087,8 +1110,12 @@ app.get(
   requireAdminRole,
   asyncHandler(async (req, res) => {
     const db = getDB();
-    const cars = await db.collection('Cars').find().sort({ _id: -1 }).toArray();
-    res.json({ success: true, count: cars.length, data: cars });
+    const { page, limit, skip } = getPaginationParams(req);
+    const [cars, total] = await Promise.all([
+      db.collection('Cars').find().sort({ _id: -1 }).skip(skip).limit(limit).toArray(),
+      db.collection('Cars').countDocuments({}),
+    ]);
+    res.json(buildPaginatedResponse({ data: cars, total, page, limit }));
   }),
 );
 
@@ -1180,8 +1207,13 @@ app.get(
   requireAdminRole,
   asyncHandler(async (req, res) => {
     const db = getDB();
-    const cars = await db.collection('Cars').find({ listing_status: 'pending' }).sort({ _id: -1 }).toArray();
-    res.json({ success: true, count: cars.length, data: cars });
+    const query = { listing_status: 'pending' };
+    const { page, limit, skip } = getPaginationParams(req);
+    const [cars, total] = await Promise.all([
+      db.collection('Cars').find(query).sort({ _id: -1 }).skip(skip).limit(limit).toArray(),
+      db.collection('Cars').countDocuments(query),
+    ]);
+    res.json(buildPaginatedResponse({ data: cars, total, page, limit }));
   }),
 );
 
@@ -1231,8 +1263,12 @@ app.get(
       }
       query.email = email;
     }
-    const favorites = await db.collection('Favourites').find(query).sort({ _id: -1 }).toArray();
-    res.json({ success: true, count: favorites.length, data: favorites });
+    const { page, limit, skip } = getPaginationParams(req);
+    const [favorites, total] = await Promise.all([
+      db.collection('Favourites').find(query).sort({ _id: -1 }).skip(skip).limit(limit).toArray(),
+      db.collection('Favourites').countDocuments(query),
+    ]);
+    res.json(buildPaginatedResponse({ data: favorites, total, page, limit }));
   }),
 );
 
@@ -1242,12 +1278,13 @@ app.get(
   requireVendorRole,
   asyncHandler(async (req, res) => {
     const db = getDB();
-    const cars = await db
-      .collection('Cars')
-      .find({ vendor_email: req.dbUser.email })
-      .sort({ _id: -1 })
-      .toArray();
-    res.json({ success: true, count: cars.length, data: cars });
+    const query = { vendor_email: req.dbUser.email };
+    const { page, limit, skip } = getPaginationParams(req);
+    const [cars, total] = await Promise.all([
+      db.collection('Cars').find(query).sort({ _id: -1 }).skip(skip).limit(limit).toArray(),
+      db.collection('Cars').countDocuments(query),
+    ]);
+    res.json(buildPaginatedResponse({ data: cars, total, page, limit }));
   }),
 );
 
@@ -1711,12 +1748,13 @@ app.get(
   requireVendorRole,
   asyncHandler(async (req, res) => {
     const db = getDB();
-    const bookings = await db
-      .collection('Bookings')
-      .find({ vendor_email: req.dbUser.email })
-      .sort({ createdAt: -1 })
-      .toArray();
-    res.json({ success: true, count: bookings.length, data: bookings });
+    const query = { vendor_email: req.dbUser.email };
+    const { page, limit, skip } = getPaginationParams(req);
+    const [bookings, total] = await Promise.all([
+      db.collection('Bookings').find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      db.collection('Bookings').countDocuments(query),
+    ]);
+    res.json(buildPaginatedResponse({ data: bookings, total, page, limit }));
   }),
 );
 
@@ -1725,12 +1763,13 @@ app.get(
   requireUser,
   asyncHandler(async (req, res) => {
     const db = getDB();
-    const bookings = await db
-      .collection('Bookings')
-      .find({ user_email: req.dbUser.email })
-      .sort({ createdAt: -1 })
-      .toArray();
-    res.json({ success: true, count: bookings.length, data: bookings });
+    const query = { user_email: req.dbUser.email };
+    const { page, limit, skip } = getPaginationParams(req);
+    const [bookings, total] = await Promise.all([
+      db.collection('Bookings').find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      db.collection('Bookings').countDocuments(query),
+    ]);
+    res.json(buildPaginatedResponse({ data: bookings, total, page, limit }));
   }),
 );
 
@@ -1824,12 +1863,13 @@ app.get(
   requireVendorRole,
   asyncHandler(async (req, res) => {
     const db = getDB();
-    const reservations = await db
-      .collection('Reservations')
-      .find({ vendor_email: req.dbUser.email })
-      .sort({ created_at: -1 })
-      .toArray();
-    res.json({ success: true, count: reservations.length, data: reservations });
+    const query = { vendor_email: req.dbUser.email };
+    const { page, limit, skip } = getPaginationParams(req);
+    const [reservations, total] = await Promise.all([
+      db.collection('Reservations').find(query).sort({ created_at: -1 }).skip(skip).limit(limit).toArray(),
+      db.collection('Reservations').countDocuments(query),
+    ]);
+    res.json(buildPaginatedResponse({ data: reservations, total, page, limit }));
   }),
 );
 
@@ -1838,12 +1878,13 @@ app.get(
   requireUser,
   asyncHandler(async (req, res) => {
     const db = getDB();
-    const reservations = await db
-      .collection('Reservations')
-      .find({ user_email: req.dbUser.email })
-      .sort({ created_at: -1 })
-      .toArray();
-    res.json({ success: true, count: reservations.length, data: reservations });
+    const query = { user_email: req.dbUser.email };
+    const { page, limit, skip } = getPaginationParams(req);
+    const [reservations, total] = await Promise.all([
+      db.collection('Reservations').find(query).sort({ created_at: -1 }).skip(skip).limit(limit).toArray(),
+      db.collection('Reservations').countDocuments(query),
+    ]);
+    res.json(buildPaginatedResponse({ data: reservations, total, page, limit }));
   }),
 );
 
@@ -1893,14 +1934,20 @@ app.get(
   requireUser,
   asyncHandler(async (req, res) => {
     const db = getDB();
-    const notifications = await db
-      .collection('Notifications')
-      .find({ user_email: req.dbUser.email })
-      .sort({ created_at: -1 })
-      .limit(100)
-      .toArray();
+    const query = { user_email: req.dbUser.email };
+    const { page, limit, skip } = getPaginationParams(req);
+    const [notifications, total, unreadCount] = await Promise.all([
+      db.collection('Notifications')
+        .find(query)
+        .sort({ created_at: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray(),
+      db.collection('Notifications').countDocuments(query),
+      db.collection('Notifications').countDocuments({ ...query, read: { $ne: true } }),
+    ]);
     const data = await Promise.all(notifications.map((notification) => decorateNotification(db, req.dbUser, notification)));
-    res.json({ success: true, count: data.length, data });
+    res.json({ ...buildPaginatedResponse({ data, total, page, limit }), unreadCount });
   }),
 );
 
