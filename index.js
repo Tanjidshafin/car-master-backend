@@ -179,6 +179,91 @@ const decorateNotification = async (db, user, notification) => ({
   route: await buildNotificationRoute(db, user, notification.type, notification.ref_id),
 });
 
+const buildChatPreviewText = ({ text = '', attachmentUrl = '' }) => {
+  const trimmedText = text.trim();
+  if (trimmedText) return trimmedText;
+  if (attachmentUrl) return 'Sent an image';
+  return '';
+};
+
+const activeSocketCounts = new Map();
+
+const getActiveSocketCount = (email) => activeSocketCounts.get(normalizeEmail(email)) || 0;
+const isUserOnline = (email) => getActiveSocketCount(email) > 0;
+
+const formatMessageDocument = (message, sender = null) => ({
+  ...message,
+  _id: message?._id?.toString?.() || message._id,
+  sender: projectPublicUser(sender || message.sender),
+  delivered_at: message.delivered_at || null,
+  seen_at: message.seen_at || null,
+});
+
+const createMessageStatusPayload = ({ conversationId, messageIds, deliveredAt = null, seenAt = null, updatedBy, type }) => ({
+  conversation_id: conversationId,
+  message_ids: messageIds.map((id) => id?.toString?.() || id),
+  delivered_at: deliveredAt,
+  seen_at: seenAt,
+  updated_by: normalizeEmail(updatedBy),
+  type,
+});
+
+const emitConversationPresenceToParticipants = async (db, email, online) => {
+  const normalizedEmail = normalizeEmail(email);
+  const conversations = await db
+    .collection('Conversations')
+    .find({ participants: normalizedEmail }, { projection: { participants: 1 } })
+    .toArray();
+
+  const recipients = new Set();
+  conversations.forEach((conversation) => {
+    (conversation.participants || []).forEach((participantEmail) => {
+      const normalizedParticipant = normalizeEmail(participantEmail);
+      if (normalizedParticipant && normalizedParticipant !== normalizedEmail) {
+        recipients.add(normalizedParticipant);
+      }
+    });
+  });
+
+  const payload = { email: normalizedEmail, online };
+  recipients.forEach((recipientEmail) => {
+    io.to(`user:${recipientEmail}`).emit('chat:presence:update', payload);
+  });
+};
+
+const getPendingIncomingMessages = async (db, email) => {
+  const normalizedEmail = normalizeEmail(email);
+  const conversations = await db
+    .collection('Conversations')
+    .find({ participants: normalizedEmail }, { projection: { _id: 1 } })
+    .toArray();
+
+  const conversationIds = conversations.map((conversation) => conversation._id.toString());
+  if (!conversationIds.length) return [];
+
+  const messages = await db
+    .collection('Messages')
+    .find(
+      {
+        conversation_id: { $in: conversationIds },
+        sender_email: { $ne: normalizedEmail },
+        delivered_at: null,
+      },
+      { projection: { _id: 1, conversation_id: 1 } },
+    )
+    .toArray();
+
+  return messages.map((message) => ({
+    _id: message._id.toString(),
+    conversation_id: message.conversation_id,
+  }));
+};
+
+const emitPendingMessagesToSocket = async (db, socket) => {
+  const pendingMessages = await getPendingIncomingMessages(db, socket.user.email);
+  socket.emit('chat:message:pending', pendingMessages);
+};
+
 io.use(async (socket, next) => {
   try {
     const email = normalizeEmail(socket.handshake.auth?.email || socket.handshake.query?.email);
@@ -195,12 +280,153 @@ io.use(async (socket, next) => {
 });
 
 io.on('connection', (socket) => {
+  const email = normalizeEmail(socket.user?.email);
+  const previousCount = getActiveSocketCount(email);
+  activeSocketCounts.set(email, previousCount + 1);
+
+  if (previousCount === 0) {
+    const db = getDB();
+    emitConversationPresenceToParticipants(db, email, true).catch(() => {});
+  }
+
+  const db = getDB();
+  emitPendingMessagesToSocket(db, socket).catch(() => {});
+
   socket.on('chat:join', (conversationId) => {
     if (conversationId) socket.join(`conversation:${conversationId}`);
   });
 
   socket.on('chat:leave', (conversationId) => {
     if (conversationId) socket.leave(`conversation:${conversationId}`);
+  });
+
+  socket.on('chat:pending:request', async () => {
+    await emitPendingMessagesToSocket(db, socket);
+  });
+
+  socket.on('chat:message:delivered', async ({ conversationId, messageId }) => {
+    if (!conversationId || !ObjectId.isValid(conversationId) || !messageId || !ObjectId.isValid(messageId)) return;
+
+    const conversation = await db.collection('Conversations').findOne({
+      _id: new ObjectId(conversationId),
+      participants: email,
+    });
+
+    if (!conversation) return;
+
+    const message = await db.collection('Messages').findOne({
+      _id: new ObjectId(messageId),
+      conversation_id: conversationId,
+      sender_email: { $ne: email },
+    });
+
+    if (!message || message.delivered_at) return;
+
+    const deliveredAt = new Date();
+    await db.collection('Messages').updateOne(
+      { _id: message._id },
+      { $set: { delivered_at: deliveredAt } },
+    );
+
+    if ((conversation.last_message_id || '') === message._id.toString()) {
+      await db.collection('Conversations').updateOne(
+        { _id: conversation._id },
+        { $set: { last_message_delivered_at: deliveredAt } },
+      );
+    }
+
+    const statusPayload = createMessageStatusPayload({
+      conversationId,
+      messageIds: [message._id],
+      deliveredAt,
+      seenAt: message.seen_at || null,
+      updatedBy: email,
+      type: 'delivered',
+    });
+
+    conversation.participants.forEach((participantEmail) => {
+      io.to(`user:${normalizeEmail(participantEmail)}`).emit('chat:message:status', statusPayload);
+    });
+    io.to(`conversation:${conversationId}`).emit('chat:message:status', statusPayload);
+  });
+
+  socket.on('chat:message:seen', async ({ conversationId, messageIds = [] }) => {
+    if (!conversationId || !ObjectId.isValid(conversationId) || !Array.isArray(messageIds) || !messageIds.length) return;
+
+    const validMessageIds = messageIds.filter((id) => ObjectId.isValid(id)).map((id) => new ObjectId(id));
+    if (!validMessageIds.length) return;
+
+    const conversation = await db.collection('Conversations').findOne({
+      _id: new ObjectId(conversationId),
+      participants: email,
+    });
+
+    if (!conversation) return;
+
+    const seenAt = new Date();
+    const deliveredAt = seenAt;
+
+    const pendingMessages = await db
+      .collection('Messages')
+      .find({
+        _id: { $in: validMessageIds },
+        conversation_id: conversationId,
+        sender_email: { $ne: email },
+        seen_at: null,
+      })
+      .project({ _id: 1, delivered_at: 1 })
+      .toArray();
+
+    if (!pendingMessages.length) return;
+
+    const pendingIds = pendingMessages.map((message) => message._id);
+    await db.collection('Messages').updateMany(
+      { _id: { $in: pendingIds } },
+      {
+        $set: {
+          seen_at: seenAt,
+          delivered_at: deliveredAt,
+        },
+      },
+    );
+
+    if (pendingIds.some((id) => id.toString() === (conversation.last_message_id || ''))) {
+      await db.collection('Conversations').updateOne(
+        { _id: conversation._id },
+        {
+          $set: {
+            last_message_delivered_at: deliveredAt,
+            last_message_seen_at: seenAt,
+          },
+        },
+      );
+    }
+
+    const statusPayload = createMessageStatusPayload({
+      conversationId,
+      messageIds: pendingIds,
+      deliveredAt,
+      seenAt,
+      updatedBy: email,
+      type: 'seen',
+    });
+
+    conversation.participants.forEach((participantEmail) => {
+      io.to(`user:${normalizeEmail(participantEmail)}`).emit('chat:message:status', statusPayload);
+    });
+    io.to(`conversation:${conversationId}`).emit('chat:message:status', statusPayload);
+  });
+
+  socket.on('disconnect', () => {
+    const currentCount = getActiveSocketCount(email);
+    if (currentCount <= 1) {
+      activeSocketCounts.delete(email);
+      const disconnectDb = getDB();
+      emitConversationPresenceToParticipants(disconnectDb, email, false).catch(() => {});
+      return;
+    }
+
+    activeSocketCounts.set(email, currentCount - 1);
   });
 });
 
@@ -1145,7 +1371,10 @@ app.post(
     if (existing) {
       await db.collection('Conversations').updateOne(
         { _id: existing._id },
-        { $pull: { hidden_for: buyerEmail } },
+        {
+          $pull: { hidden_for: buyerEmail },
+          $set: { updatedAt: new Date() },
+        },
       );
       const restored = await db.collection('Conversations').findOne({ _id: existing._id });
       return res.json({ success: true, data: restored });
@@ -1163,6 +1392,10 @@ app.post(
       updatedAt: new Date(),
       last_message: '',
       last_message_at: null,
+      last_message_id: null,
+      last_message_sender_email: '',
+      last_message_delivered_at: null,
+      last_message_seen_at: null,
       hidden_for: [],
     };
 
@@ -1213,10 +1446,32 @@ app.get(
           },
         },
         {
+          $lookup: {
+            from: 'Messages',
+            let: { conversationId: { $toString: '$_id' } },
+            pipeline: [
+              {
+                $match: {
+                  $expr: {
+                    $and: [
+                      { $eq: ['$conversation_id', '$$conversationId'] },
+                      { $ne: ['$sender_email', req.dbUser.email] },
+                      { $eq: [{ $ifNull: ['$seen_at', null] }, null] },
+                    ],
+                  },
+                },
+              },
+              { $count: 'count' },
+            ],
+            as: 'unreadLookup',
+          },
+        },
+        {
           $addFields: {
             buyer: { $arrayElemAt: ['$buyerLookup', 0] },
             vendor: { $arrayElemAt: ['$vendorLookup', 0] },
             car: { $arrayElemAt: ['$carLookup', 0] },
+            unread_count: { $ifNull: [{ $arrayElemAt: ['$unreadLookup.count', 0] }, 0] },
           },
         },
         {
@@ -1231,6 +1486,7 @@ app.get(
             buyerLookup: 0,
             vendorLookup: 0,
             carLookup: 0,
+            unreadLookup: 0,
           },
         },
         { $sort: { updatedAt: -1, last_message_at: -1, _id: -1 } },
@@ -1243,6 +1499,12 @@ app.get(
       vendor: projectPublicUser(conversation.vendor),
       counterpart: projectPublicUser(conversation.counterpart),
       car_image: conversation.car?.image || '',
+      counterpart_online: isUserOnline(conversation.counterpart?.email),
+      unread_count: conversation.unread_count || 0,
+      last_message_id: conversation.last_message_id || null,
+      last_message_sender_email: conversation.last_message_sender_email || '',
+      last_message_delivered_at: conversation.last_message_delivered_at || null,
+      last_message_seen_at: conversation.last_message_seen_at || null,
     }));
 
     res.json({ success: true, count: data.length, data });
@@ -1315,7 +1577,7 @@ app.get(
       .toArray();
 
     const data = messages.map((message) => ({
-      ...message,
+      ...formatMessageDocument(message),
       sender: projectPublicUser(message.sender),
     }));
 
@@ -1328,12 +1590,12 @@ app.post(
   requireUser,
   asyncHandler(async (req, res) => {
     const db = getDB();
-    const { conversation_id, text } = req.body;
+    const { conversation_id, text = '', attachment_url = '', attachment_name = '', attachment_type = '' } = req.body;
     if (!conversation_id || !ObjectId.isValid(conversation_id)) {
       return res.status(400).json({ success: false, error: 'Valid conversation_id is required' });
     }
-    if (!text || !text.trim()) {
-      return res.status(400).json({ success: false, error: 'Message text is required' });
+    if (!text.trim() && !attachment_url.trim()) {
+      return res.status(400).json({ success: false, error: 'Message text or attachment is required' });
     }
 
     const conversation = await db.collection('Conversations').findOne({ _id: new ObjectId(conversation_id) });
@@ -1346,19 +1608,32 @@ app.post(
       sender_email: req.dbUser.email,
       sender_id: req.dbUser._id.toString(),
       text: text.trim(),
+      attachment_url: attachment_url.trim(),
+      attachment_name: attachment_name.trim(),
+      attachment_type: attachment_type.trim(),
+      delivered_at: null,
+      seen_at: null,
       createdAt: new Date(),
     };
 
     const result = await db.collection('Messages').insertOne(payload);
-    const message = { _id: result.insertedId, ...payload, sender: projectPublicUser(req.dbUser) };
+    const message = formatMessageDocument({ _id: result.insertedId, ...payload }, req.dbUser);
+    const previewText = buildChatPreviewText({
+      text: message.text,
+      attachmentUrl: message.attachment_url,
+    });
 
     await db.collection('Conversations').updateOne(
       { _id: conversation._id },
       {
         $set: {
           updatedAt: new Date(),
-          last_message: message.text,
+          last_message: previewText,
           last_message_at: message.createdAt,
+          last_message_id: message._id,
+          last_message_sender_email: req.dbUser.email,
+          last_message_delivered_at: null,
+          last_message_seen_at: null,
           hidden_for: [],
         },
       },
