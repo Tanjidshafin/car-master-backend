@@ -205,6 +205,183 @@ const buildPaginatedResponse = ({ data, total, page, limit }) => ({
   data,
 });
 
+const PUBLIC_CATALOG_BASE_QUERY = {
+  $and: [
+    { $or: [{ listing_status: 'approved' }, { listing_status: { $exists: false } }] },
+    { $or: [{ inventory_status: 'available' }, { inventory_status: { $exists: false } }] },
+  ],
+};
+
+const escapeRegex = (value = '') => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const normalizeQueryValue = (value) => (typeof value === 'string' ? value.trim() : '');
+
+const isMeaningfulQueryValue = (value) => {
+  const normalized = normalizeQueryValue(value).toLowerCase();
+  return !!normalized && !['all', 'default'].includes(normalized);
+};
+
+const parseOptionalNumber = (value) => {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const parseCsvQuery = (value) => {
+  if (!value) return [];
+
+  return [...new Set(
+    value
+      .split(',')
+      .map((item) => normalizeQueryValue(item))
+      .filter(Boolean),
+  )];
+};
+
+const buildExactMatchRegex = (value) => ({
+  $regex: `^${escapeRegex(normalizeQueryValue(value))}$`,
+  $options: 'i',
+});
+
+const buildContainsRegex = (value) => ({
+  $regex: escapeRegex(normalizeQueryValue(value)),
+  $options: 'i',
+});
+
+const buildCatalogSort = (sortBy = 'default') => {
+  const sortMap = {
+    default: { _id: -1 },
+    'price-asc': { price: 1, _id: -1 },
+    'price-desc': { price: -1, _id: -1 },
+    'year-asc': { yearNum: 1, _id: -1 },
+    'year-desc': { yearNum: -1, _id: -1 },
+  };
+
+  return sortMap[sortBy] || sortMap.default;
+};
+
+const getCatalogMetaValues = async (db, fieldPath) => {
+  const [result] = await db
+    .collection('Cars')
+    .aggregate([
+      { $match: PUBLIC_CATALOG_BASE_QUERY },
+      {
+        $group: {
+          _id: `$${fieldPath}`,
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          value: {
+            $trim: {
+              input: {
+                $convert: {
+                  input: '$_id',
+                  to: 'string',
+                  onError: '',
+                  onNull: '',
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        $match: {
+          value: { $ne: '' },
+        },
+      },
+      {
+        $sort: { value: 1 },
+      },
+      {
+        $group: {
+          _id: null,
+          values: { $push: '$value' },
+        },
+      },
+    ])
+    .toArray();
+
+  return result?.values || [];
+};
+
+const buildCatalogMatch = (query = {}) => {
+  const {
+    q,
+    brand,
+    model,
+    condition,
+    transmission,
+    fuel_type: fuelType,
+    minPrice,
+    maxPrice,
+    minYear,
+    maxYear,
+    colors,
+    location,
+  } = query;
+
+  const match = { ...PUBLIC_CATALOG_BASE_QUERY };
+  const andClauses = [...PUBLIC_CATALOG_BASE_QUERY.$and];
+
+  if (isMeaningfulQueryValue(q)) {
+    const searchRegex = buildContainsRegex(q);
+    andClauses.push({
+      $or: [
+        { name: searchRegex },
+        { brand: searchRegex },
+        { model: searchRegex },
+        { location: searchRegex },
+      ],
+    });
+  }
+
+  if (isMeaningfulQueryValue(brand)) andClauses.push({ brand: buildExactMatchRegex(brand) });
+  if (isMeaningfulQueryValue(model)) andClauses.push({ model: buildExactMatchRegex(model) });
+  if (isMeaningfulQueryValue(condition)) andClauses.push({ 'specs.condition': buildExactMatchRegex(condition) });
+  if (isMeaningfulQueryValue(transmission)) andClauses.push({ 'specs.transmission': buildExactMatchRegex(transmission) });
+  if (isMeaningfulQueryValue(fuelType)) andClauses.push({ fuel_type: buildExactMatchRegex(fuelType) });
+  if (isMeaningfulQueryValue(location)) andClauses.push({ location: buildExactMatchRegex(location) });
+
+  const parsedMinPrice = parseOptionalNumber(minPrice);
+  const parsedMaxPrice = parseOptionalNumber(maxPrice);
+  const hasValidPriceRange =
+    parsedMinPrice === null || parsedMaxPrice === null || parsedMinPrice <= parsedMaxPrice;
+
+  if ((parsedMinPrice !== null || parsedMaxPrice !== null) && hasValidPriceRange) {
+    const priceMatch = {};
+    if (parsedMinPrice !== null) priceMatch.$gte = parsedMinPrice;
+    if (parsedMaxPrice !== null) priceMatch.$lte = parsedMaxPrice;
+    if (Object.keys(priceMatch).length) andClauses.push({ price: priceMatch });
+  }
+
+  const colorList = parseCsvQuery(colors);
+  if (colorList.length) {
+    andClauses.push({
+      'specs.color': {
+        $in: colorList.map((color) => new RegExp(`^${escapeRegex(color)}$`, 'i')),
+      },
+    });
+  }
+
+  const parsedMinYear = parseOptionalNumber(minYear);
+  const parsedMaxYear = parseOptionalNumber(maxYear);
+  const yearMatch = {};
+  const hasValidYearRange =
+    parsedMinYear === null || parsedMaxYear === null || parsedMinYear <= parsedMaxYear;
+  if (hasValidYearRange) {
+    if (parsedMinYear !== null) yearMatch.$gte = parsedMinYear;
+    if (parsedMaxYear !== null) yearMatch.$lte = parsedMaxYear;
+  }
+
+  return {
+    match: { ...match, $and: andClauses },
+    yearMatch: Object.keys(yearMatch).length ? yearMatch : null,
+  };
+};
+
 const activeSocketCounts = new Map();
 
 const getActiveSocketCount = (email) => activeSocketCounts.get(normalizeEmail(email)) || 0;
@@ -623,47 +800,9 @@ app.get(
   '/api/cars',
   asyncHandler(async (req, res) => {
     const db = getDB();
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 12, 1), 100);
-    const skip = (page - 1) * limit;
-
-    const {
-      sortBy = 'default',
-      sortOrder = 'desc',
-      condition,
-      brand,
-      transmission,
-      minPrice,
-      maxPrice,
-      minYear,
-      maxYear,
-      colors,
-    } = req.query;
-
-    const match = { $or: [{ listing_status: 'approved' }, { listing_status: { $exists: false } }] };
-    if (condition && condition !== 'all') match['specs.condition'] = { $regex: `^${condition}$`, $options: 'i' };
-    if (brand && brand !== 'All Makes') match.brand = brand;
-    if (transmission && transmission !== 'All') match['specs.transmission'] = transmission;
-
-    if (minPrice || maxPrice) {
-      match.price = {};
-      if (minPrice !== undefined) match.price.$gte = Number(minPrice);
-      if (maxPrice !== undefined) match.price.$lte = Number(maxPrice);
-    }
-
-    if (colors) {
-      const colorList = colors.split(',').map((color) => color.trim()).filter(Boolean);
-      if (colorList.length > 0) match['specs.color'] = { $in: colorList };
-    }
-
-    const sortMap = {
-      'price-asc': { price: 1, _id: -1 },
-      'price-desc': { price: -1, _id: -1 },
-      'year-asc': { yearNum: 1, _id: -1 },
-      'year-desc': { yearNum: -1, _id: -1 },
-      default: { _id: -1 },
-    };
-    const sort = sortMap[sortBy] || { [sortBy]: sortOrder === 'asc' ? 1 : -1, _id: -1 };
+    const { page, limit, skip } = getPaginationParams(req, { limit: 12, maxLimit: 100 });
+    const { match, yearMatch } = buildCatalogMatch(req.query);
+    const sort = buildCatalogSort(req.query.sortBy);
 
     const pipeline = [
       {
@@ -681,10 +820,7 @@ app.get(
       { $match: match },
     ];
 
-    if (minYear || maxYear) {
-      const yearMatch = {};
-      if (minYear !== undefined) yearMatch.$gte = Number(minYear);
-      if (maxYear !== undefined) yearMatch.$lte = Number(maxYear);
+    if (yearMatch) {
       pipeline.push({ $match: { yearNum: yearMatch } });
     }
 
@@ -704,15 +840,7 @@ app.get(
     });
     const total = result?.totalCount?.[0]?.count || 0;
 
-    res.json({
-      success: true,
-      count: cars.length,
-      total,
-      page,
-      limit,
-      totalPages: Math.ceil(total / limit),
-      data: cars,
-    });
+    res.json(buildPaginatedResponse({ data: cars, total, page, limit }));
   }),
 );
 
@@ -720,13 +848,62 @@ app.get(
   '/api/cars/meta',
   asyncHandler(async (req, res) => {
     const db = getDB();
-    const [brands, colors] = await Promise.all([
-      db.collection('Cars').distinct('brand', { $or: [{ listing_status: 'approved' }, { listing_status: { $exists: false } }] }),
-      db.collection('Cars').distinct('specs.color', { $or: [{ listing_status: 'approved' }, { listing_status: { $exists: false } }] }),
+    const [brands, models, conditions, transmissions, fuelTypes, colors, locations, boundsResult] = await Promise.all([
+      getCatalogMetaValues(db, 'brand'),
+      getCatalogMetaValues(db, 'model'),
+      getCatalogMetaValues(db, 'specs.condition'),
+      getCatalogMetaValues(db, 'specs.transmission'),
+      getCatalogMetaValues(db, 'fuel_type'),
+      getCatalogMetaValues(db, 'specs.color'),
+      getCatalogMetaValues(db, 'location'),
+      db
+        .collection('Cars')
+        .aggregate([
+          { $match: PUBLIC_CATALOG_BASE_QUERY },
+          {
+            $addFields: {
+              yearNum: {
+                $convert: {
+                  input: '$specs.year',
+                  to: 'int',
+                  onError: null,
+                  onNull: null,
+                },
+              },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              minPrice: { $min: '$price' },
+              maxPrice: { $max: '$price' },
+              minYear: { $min: '$yearNum' },
+              maxYear: { $max: '$yearNum' },
+            },
+          },
+        ])
+        .toArray(),
     ]);
+
+    const bounds = boundsResult[0] || {};
+
     res.json({
       success: true,
-      data: { brands: brands.filter(Boolean).sort(), colors: colors.filter(Boolean).sort() },
+      data: {
+        brands,
+        models,
+        conditions,
+        transmissions,
+        fuelTypes,
+        colors,
+        locations,
+        bounds: {
+          minPrice: Number.isFinite(bounds.minPrice) ? bounds.minPrice : 0,
+          maxPrice: Number.isFinite(bounds.maxPrice) ? bounds.maxPrice : 0,
+          minYear: Number.isFinite(bounds.minYear) ? bounds.minYear : null,
+          maxYear: Number.isFinite(bounds.maxYear) ? bounds.maxYear : null,
+        },
+      },
     });
   }),
 );
